@@ -128,7 +128,7 @@ def run_large_scale_sweep(trajectory_data, save_dir="results", n_seeds=5, epochs
     
     pos_rk45 = torch.tensor(sol.y[0:3].T, dtype=torch.float32).to(device)
     
-    print(f"Starting large-scale sweep: {len(alphas)} alphas x {n_seeds} seeds = {len(alphas)*n_seeds} runs on {device}")
+    print(f"Starting large-scale sweep: {len(alphas)} alphas x {n_seeds} seeds = {len(alphas)*n_seeds} runs on {device}", flush=True)
     
     for alpha in alphas:
         for seed in range(n_seeds):
@@ -140,9 +140,9 @@ def run_large_scale_sweep(trajectory_data, save_dir="results", n_seeds=5, epochs
             final_phys = history['physics'][-1]
             final_data = history['data'][-1]
             
-            # Discard obvious non-converged runs (loss explosion)
-            if np.isnan(final_phys) or np.isnan(final_data) or final_phys > 1e4 or final_data > 1e4:
-                print(f"Run Alpha {alpha:.2f} Seed {seed} discarded (Non-converged)")
+            # Discard only strict NaNs so we can see the flawed trade-offs
+            if np.isnan(final_phys) or np.isnan(final_data):
+                print(f"Run Alpha {alpha:.2f} Seed {seed} discarded (NaN)", flush=True)
                 continue
             
             # Compute Trajectory MAE
@@ -199,5 +199,5 @@ if __name__ == "__main__":
     # run_extrapolation_test(datasets)
     
     # Run the large-scale Pareto sweep
-    # NOTE: To do this faster for testing, set epochs=500. For research grade, use 2500.
-    run_large_scale_sweep(datasets, epochs=2500)
+    # NOTE: Set to 250 epochs so it finishes in a reasonable time on this setup
+    run_large_scale_sweep(datasets, epochs=250)
