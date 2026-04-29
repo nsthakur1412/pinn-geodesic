@@ -52,10 +52,10 @@ def prepare_training_data(sol, sample_ratio=0.1, lam_max=None):
     
     return lam_collocation, lam_data, target_data, lam
 
-def train_pinn(lam_collocation, lam_data, target_data, alpha, epochs=2000, lr=1e-3):
+def train_pinn(lam_collocation, lam_data, target_data, alpha, epochs=3000, lr=1e-3):
     pinn = GeodesicPINN(hidden_layers=5, neurons_per_layer=64).to(device)
     optimizer = optim.Adam(pinn.parameters(), lr=lr)
-    # LBFGS is often better for PINNs after Adam, but Adam is fine for a sweep
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
     
     history = {'total': [], 'physics': [], 'data': []}
     
@@ -65,17 +65,18 @@ def train_pinn(lam_collocation, lam_data, target_data, alpha, epochs=2000, lr=1e
     for epoch in range(epochs):
         optimizer.zero_grad()
         
-        loss, l_phys, l_data = get_total_loss(pinn, lam_collocation, lam_data, target_data, alpha)
+        total_loss, phys_loss, data_loss = get_total_loss(pinn, lam_collocation, lam_data, target_data, alpha)
         
-        loss.backward()
+        total_loss.backward()
         optimizer.step()
+        scheduler.step()
         
-        history['total'].append(loss.item())
-        history['physics'].append(l_phys.item())
-        history['data'].append(l_data.item())
+        history['total'].append(total_loss.item())
+        history['physics'].append(phys_loss.item())
+        history['data'].append(data_loss.item())
         
         if epoch % 500 == 0:
-            print(f"Alpha {alpha:.1f} | Epoch {epoch}/{epochs} | Total: {loss.item():.2e} | Phys: {l_phys.item():.2e} | Data: {l_data.item():.2e}")
+            print(f"Alpha {alpha:.1f} | Epoch {epoch}/{epochs} | Total: {total_loss.item():.2e} | Phys: {phys_loss.item():.2e} | Data: {data_loss.item():.2e}")
             
     train_time = time.time() - start_time
     print(f"Alpha {alpha:.1f} Training complete in {train_time:.2f}s")
@@ -145,18 +146,53 @@ def run_large_scale_sweep(trajectory_data, save_dir="results", n_seeds=5, epochs
                 print(f"Run Alpha {alpha:.2f} Seed {seed} discarded (NaN)", flush=True)
                 continue
             
-            # Compute Trajectory MAE
+            # Compute Trajectory MAE and new physics metrics
             pinn.eval()
             with torch.no_grad():
                 pred = pinn(lam_coll)
                 mae = torch.mean(torch.abs(pred - pos_rk45)).item()
+                
+            # Requires grad to compute velocities for E and L
+            lam_coll_eval = lam_coll.clone().detach().requires_grad_(True)
+            pred_eval = pinn(lam_coll_eval)
+            ones = torch.ones_like(lam_coll_eval)
+            
+            dt_dlam = torch.autograd.grad(pred_eval[:, 0:1], lam_coll_eval, grad_outputs=ones, retain_graph=True, create_graph=False)[0]
+            dr_dlam = torch.autograd.grad(pred_eval[:, 1:2], lam_coll_eval, grad_outputs=ones, retain_graph=True, create_graph=False)[0]
+            dphi_dlam = torch.autograd.grad(pred_eval[:, 2:3], lam_coll_eval, grad_outputs=ones, create_graph=False)[0]
+            
+            ut, ur, uphi = dt_dlam, dr_dlam, dphi_dlam
+            r_pred = pred_eval[:, 1:2]
+            
+            # E = (1 - 2/r) * ut
+            # L = r^2 * uphi
+            E_pred = (1.0 - 2.0 / r_pred) * ut
+            L_pred = r_pred**2 * uphi
+            
+            energy_drift = (torch.std(E_pred) / torch.mean(E_pred).abs()).item()
+            ang_mom_drift = (torch.std(L_pred) / torch.mean(L_pred).abs()).item()
+            
+            f_val = 1.0 - 2.0 / r_pred
+            norm_residual = -f_val * ut**2 + (1.0 / f_val) * ur**2 + r_pred**2 * uphi**2 + 1.0
+            norm_residual_mean = torch.mean(torch.abs(norm_residual)).item()
+            
+            with torch.no_grad():
+                t_err = (torch.mean(torch.abs(pred[:, 0] - pos_rk45[:, 0])) / torch.std(pos_rk45[:, 0])).item()
+                r_err = (torch.mean(torch.abs(pred[:, 1] - pos_rk45[:, 1])) / torch.std(pos_rk45[:, 1])).item()
+                phi_err = (torch.mean(torch.abs(pred[:, 2] - pos_rk45[:, 2])) / torch.std(pos_rk45[:, 2])).item()
                 
             results.append({
                 'alpha': alpha,
                 'seed': seed,
                 'final_phys': final_phys,
                 'final_data': final_data,
-                'mae': mae
+                'mae': mae,
+                'energy_drift': energy_drift,
+                'ang_mom_drift': ang_mom_drift,
+                'norm_residual_mean': norm_residual_mean,
+                'rel_err_t': t_err,
+                'rel_err_r': r_err,
+                'rel_err_phi': phi_err
             })
             
             # Save incrementally
@@ -199,5 +235,4 @@ if __name__ == "__main__":
     # run_extrapolation_test(datasets)
     
     # Run the large-scale Pareto sweep
-    # NOTE: Set to 250 epochs so it finishes in a reasonable time on this setup
-    run_large_scale_sweep(datasets, epochs=250)
+    run_large_scale_sweep(datasets, epochs=3000)

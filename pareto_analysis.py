@@ -44,13 +44,23 @@ def plot_pareto_analysis(results, save_dir="plots"):
     norm_phys = final_phys / np.median(final_phys)
     norm_data = final_data / np.median(final_data)
     
+    # Remove outlier runs (unconverged or diverged) before Pareto extraction
+    p75_phys = np.percentile(final_phys, 75)
+    p75_data = np.percentile(final_data, 75)
+    valid_mask = (final_phys < 5 * p75_phys) & (final_data < 5 * p75_data)
+    
+    norm_phys_f = norm_phys[valid_mask]
+    norm_data_f = norm_data[valid_mask]
+    alphas_f = alphas[valid_mask]
+    maes_f = maes[valid_mask]
+    
     # 2. Extract Pareto Front
-    pareto_indices = extract_pareto_front(norm_data, norm_phys)
+    pareto_indices = extract_pareto_front(norm_data_f, norm_phys_f)
     
     # Sort the Pareto points by L_data to prevent zig-zag lines
-    pareto_data = norm_data[pareto_indices]
-    pareto_phys = norm_phys[pareto_indices]
-    pareto_alphas = alphas[pareto_indices]
+    pareto_data = norm_data_f[pareto_indices]
+    pareto_phys = norm_phys_f[pareto_indices]
+    pareto_alphas = alphas_f[pareto_indices]
     
     sort_idx = np.argsort(pareto_data)
     pareto_data = pareto_data[sort_idx]
@@ -130,6 +140,42 @@ def plot_pareto_analysis(results, save_dir="plots"):
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, "performance_vs_alpha.png"), dpi=300)
     plt.close()
+    
+    # 5. Conserved Quantity Stability Plot
+    if 'energy_drift' in results[0]:
+        energy_drifts = np.array([r['energy_drift'] for r in results])
+        
+        unique_alphas = np.unique(alphas)
+        mean_energy_drift = []
+        std_energy_drift = []
+        
+        for a in unique_alphas:
+            idx = (alphas == a)
+            a_drifts = energy_drifts[idx]
+            mean_energy_drift.append(np.mean(a_drifts))
+            std_energy_drift.append(np.std(a_drifts))
+            
+        mean_energy_drift = np.array(mean_energy_drift)
+        std_energy_drift = np.array(std_energy_drift)
+        
+        plt.figure(figsize=(8, 5))
+        for a in unique_alphas:
+            idx = (alphas == a)
+            plt.scatter([a]*idx.sum(), energy_drifts[idx], alpha=0.4, s=30, color='steelblue')
+        
+        plt.plot(unique_alphas, mean_energy_drift, 'b-', linewidth=2, label='Mean |ΔE/E|')
+        plt.fill_between(unique_alphas, mean_energy_drift - std_energy_drift,
+                         mean_energy_drift + std_energy_drift, alpha=0.2, color='blue')
+        
+        plt.xlabel('Alpha (physics weight)')
+        plt.ylabel('Relative energy drift |ΔE/E|')
+        plt.title('Physical consistency vs alpha trade-off')
+        plt.yscale('log')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, 'conserved_quantity_stability.png'), dpi=300)
+        plt.close()
     
     print("Pareto analysis plots generated successfully.")
 

@@ -14,7 +14,7 @@ class GeodesicPINN(nn.Module):
         # Hidden layers
         for _ in range(hidden_layers - 1):
             layers.append(nn.Linear(neurons_per_layer, neurons_per_layer))
-            layers.append(nn.Tanh())
+            layers.append(nn.SiLU())
             
         # Output layer: t, r, phi (3D)
         layers.append(nn.Linear(neurons_per_layer, 3))
@@ -57,21 +57,20 @@ def compute_physics_loss(pinn, lam):
     # We add a small epsilon or mask invalid regions if necessary, 
     # but the training domain should be r > 2.0.
     
-    # dut_dlam = -2.0 * (1.0 / (r * (r - 2.0))) * ut * ur
-    res_t = dut_dlam + 2.0 * (1.0 / (r * (r - 2.0))) * ut * ur
+    # Add epsilon to prevent division by zero near singularity
+    denom = r * (r - 2.0)
+    denom = torch.where(denom.abs() < 1e-4, torch.sign(denom) * 1e-4 + 1e-6, denom)
     
-    # dur_dlam = - ((r - 2.0) / r**3) * ut**2 + (1.0 / (r * (r - 2.0))) * ur**2 + (r - 2.0) * uphi**2
-    res_r = dur_dlam + ((r - 2.0) / r**3) * ut**2 - (1.0 / (r * (r - 2.0))) * ur**2 - (r - 2.0) * uphi**2
+    res_t = dut_dlam + 2.0 * (1.0 / denom) * ut * ur
+    res_r = dur_dlam + ((r - 2.0) / (r**3 + 1e-6)) * ut**2 - (1.0 / denom) * ur**2 - (r - 2.0) * uphi**2
+    res_phi = duphi_dlam + 2.0 * (1.0 / (r + 1e-6)) * ur * uphi
     
-    # duphi_dlam = -2.0 * (1.0 / r) * ur * uphi
-    res_phi = duphi_dlam + 2.0 * (1.0 / r) * ur * uphi
-    
-    physics_loss = torch.mean(res_t**2) + torch.mean(res_r**2) + torch.mean(res_phi**2)
+    physics_loss = (torch.mean(res_t**2) + torch.mean(res_r**2) + torch.mean(res_phi**2)) / 3.0
     
     # 5. Normalization Constraint (optional loss term, but we track it)
     # -f(r) ut^2 + (1/f(r)) ur^2 + r^2 uphi^2 = -1
     # f_val = 1.0 - 2.0 / r
-    # norm = -f_val * ut**2 + (1.0 / f_val) * ur**2 + r**2 * uphi**2
+    # norm = -f_val * ut**2 + (1.0 / f_val) * ur**2 + r^2 * uphi**2
     # norm_loss = torch.mean((norm + 1.0)**2)
     # We could add norm_loss to physics_loss, but let's stick to the geodesic ODE residuals.
     
@@ -96,5 +95,9 @@ def get_total_loss(pinn, lam_collocation, lam_data, target_data, alpha):
     L_physics = compute_physics_loss(pinn, lam_collocation)
     L_data = get_data_loss(pinn, lam_data, target_data)
     
-    total_loss = alpha * L_physics + (1.0 - alpha) * L_data
+    # IC enforcement: pin prediction at lambda=0 to ground truth IC
+    ic_pred = pinn(lam_collocation[0:1].detach().requires_grad_(False))
+    ic_loss = torch.mean((ic_pred - target_data[0:1]) ** 2)
+    
+    total_loss = alpha * (L_physics + ic_loss) + (1.0 - alpha) * L_data
     return total_loss, L_physics, L_data
