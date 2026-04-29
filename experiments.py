@@ -231,8 +231,8 @@ if __name__ == "__main__":
         datasets = pickle.load(f)
         
     # We keep the single alpha sweep for basic testing
-    # run_alpha_sweep(datasets)
-    # run_extrapolation_test(datasets)
+    run_alpha_sweep(datasets)
+    run_extrapolation_test(datasets)
     
     # Run the large-scale Pareto sweep
     run_large_scale_sweep(datasets, epochs=3000)

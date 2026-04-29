@@ -191,7 +191,9 @@ def main():
     bound_sol = datasets['bound']
     
     # 1. Trade-off plot
-    generate_tradeoff_plot(alpha_sweep, "plots/tradeoff_curve.png")
+    # Disabled: The single-seed tradeoff curve is misleading. 
+    # Use pareto_analysis.py for the rigorous multi-seed Pareto front instead.
+    # generate_tradeoff_plot(alpha_sweep, "plots/tradeoff_curve.png")
     
     # 2. Detailed plots for specific alphas
     for alpha in [0.0, 0.5, 1.0]:
