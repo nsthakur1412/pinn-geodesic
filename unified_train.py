@@ -4,6 +4,8 @@ import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 import time
 import os
+import matplotlib.pyplot as plt
+import pickle
 from unified_model import UnifiedPINN, compute_unified_physics_loss
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -25,15 +27,24 @@ def train_unified_pinn():
     # 3. Model & Optimizers
     pinn = UnifiedPINN(hidden_layers=5, neurons_per_layer=128).to(device)
     
-    epochs = 500
+    if os.path.exists("results/unified_pinn.pt"):
+        print("Loading pre-trained model to continue training...")
+        pinn.load_state_dict(torch.load("results/unified_pinn.pt", map_location=device, weights_only=True))
+
+    
+    epochs = 3000
     optimizer = optim.Adam(pinn.parameters(), lr=1e-3)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
     
-    alpha = 0.5
-    beta = 1.0
+    lambda_phys = 10.0
+    lambda_data = 1.0
+    lambda_ic = 5.0
     
     print("Starting DeepONet / Parameterized PINN training...")
     start_time = time.time()
+    
+    history = {'epoch': [], 'total': [], 'phys': [], 'data': [], 'ic': []}
+    os.makedirs("plots", exist_ok=True)
     
     for epoch in range(epochs):
         epoch_loss, epoch_phys, epoch_data, epoch_ic = 0.0, 0.0, 0.0, 0.0
@@ -81,7 +92,7 @@ def train_unified_pinn():
                 L_ic = torch.tensor(0.0, device=device)
             
             # Total Balanced Loss
-            L_total = alpha * L_phys + (1.0 - alpha) * L_data + beta * L_ic
+            L_total = lambda_phys * L_phys + lambda_data * L_data + lambda_ic * L_ic
             
             L_total.backward()
             optimizer.step()
@@ -99,7 +110,34 @@ def train_unified_pinn():
             avg_phys = epoch_phys / len(dataloader)
             avg_data = epoch_data / len(dataloader)
             avg_ic = epoch_ic / len(dataloader)
-            print(f"Epoch {epoch:3d} | Total: {avg_loss:.2e} | Phys: {avg_phys:.2e} | Data: {avg_data:.2e} | IC: {avg_ic:.2e}")
+            ratio = avg_phys / (avg_data + 1e-6)
+            print(f"Epoch {epoch:3d} | Total: {avg_loss:.2e} | Phys: {avg_phys:.2e} | Data: {avg_data:.2e} | IC: {avg_ic:.2e} | Phys/Data: {ratio:.2e}")
+            
+            # Record history
+            history['epoch'].append(epoch)
+            history['total'].append(avg_loss)
+            history['phys'].append(avg_phys)
+            history['data'].append(avg_data)
+            history['ic'].append(avg_ic)
+            
+            # Save Live Plot
+            plt.figure(figsize=(8, 6))
+            plt.plot(history['epoch'], history['total'], 'k-', linewidth=2, label='Total Loss')
+            plt.plot(history['epoch'], history['phys'], 'r--', label='Physics Loss')
+            plt.plot(history['epoch'], history['data'], 'b--', label='Data Loss')
+            plt.plot(history['epoch'], history['ic'], 'g--', label='IC Loss')
+            plt.yscale('log')
+            plt.xlabel('Epochs')
+            plt.ylabel('Log MSE Loss')
+            plt.title('Live DeepONet Training Loss')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig('plots/live_unified_loss.png', dpi=150)
+            plt.close()
+            
+            with open("data/unified_history.pkl", "wb") as f:
+                pickle.dump(history, f)
             
     train_time = time.time() - start_time
     print(f"\nTraining completed in {train_time:.2f}s")
