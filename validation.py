@@ -90,7 +90,7 @@ def run_sparsity_test(sol, force_retrain=False):
                     # Compute MAE vs RK45 (interpolated)
                     rk45_coll = np.zeros((len(lam_coll), 3))
                     for i in range(3):
-                        rk45_coll[:, i] = np.interp(lam_coll.cpu().numpy().flatten(), sol.t, sol.y[i])
+                        rk45_coll[:, i] = np.interp(lam_coll.cpu().detach().numpy().flatten(), sol.t, sol.y[i])
                     rk45_coll_tensor = torch.tensor(rk45_coll, dtype=torch.float32, device=pred.device)
                     
                     mae = torch.mean(torch.abs(pred - rk45_coll_tensor)).item()
@@ -103,8 +103,9 @@ def run_sparsity_test(sol, force_retrain=False):
                     
                     results.append({'sample_ratio': sr, 'alpha': a, 'seed': s, 'mae': mae, 'energy_drift': energy_drift})
                     
-        with open(filepath, "wb") as f:
-            pickle.dump(results, f)
+                    # Incremental save
+                    with open(filepath, "wb") as f:
+                        pickle.dump(results, f)
             
     # Print table
     print(f"{'sample_ratio':<15} | {'alpha=0.0 MAE':<15} | {'alpha=0.5 MAE':<15} | {'alpha=0.9 MAE':<15}")
@@ -196,7 +197,7 @@ def run_noise_test(sol, force_retrain=False):
                     
                     rk45_coll = np.zeros((len(lam_coll), 3))
                     for i in range(3):
-                        rk45_coll[:, i] = np.interp(lam_coll.cpu().numpy().flatten(), sol.t, sol.y[i])
+                        rk45_coll[:, i] = np.interp(lam_coll.cpu().detach().numpy().flatten(), sol.t, sol.y[i])
                     rk45_coll_tensor = torch.tensor(rk45_coll, dtype=torch.float32, device=pred.device)
                     
                     mae_clean = torch.mean(torch.abs(pred - rk45_coll_tensor)).item()
@@ -209,8 +210,9 @@ def run_noise_test(sol, force_retrain=False):
                     
                     results.append({'noise_level': nl, 'alpha': a, 'seed': s, 'mae_clean': mae_clean, 'energy_drift': energy_drift})
                     
-        with open(filepath, "wb") as f:
-            pickle.dump(results, f)
+                    # Incremental save
+                    with open(filepath, "wb") as f:
+                        pickle.dump(results, f)
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
     colors = {0.0: '#e66101', 0.5: '#5e3c99', 0.9: '#1a9641'}
@@ -294,8 +296,9 @@ def run_ode_generalisation_test(sol, force_retrain=False):
             print(f"{a:<10.1f} | {res_train:<15.4e} | {res_heldout:<15.4e} | {gap*100:<10.2f}%")
             results.append({'alpha': a, 'res_train': res_train, 'res_heldout': res_heldout, 'gap': gap})
             
-        with open(filepath, "wb") as f:
-            pickle.dump(results, f)
+            # Incremental save
+            with open(filepath, "wb") as f:
+                pickle.dump(results, f)
 
     alphas = [r['alpha'] for r in results]
     res_train = [r['res_train'] for r in results]

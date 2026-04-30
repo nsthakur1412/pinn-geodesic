@@ -81,10 +81,10 @@ def generate_datasets(save_dir="data"):
     datasets = {}
     
     # 1. Bound Orbit
-    # L = 4 (uphi = 0.04 at r=10), E = 0.963
+    # L = 3.2 (uphi = 0.05 at r=8)
     # Oscillates between periapsis and apoapsis
     print("Generating Bound Orbit...")
-    state_bound = get_initial_state(r0=10.0, ur0=0.0, uphi0=0.04)
+    state_bound = get_initial_state(r0=8.0, ur0=0.0, uphi0=0.05)
     sol_bound = solve_geodesic(state_bound, [0, 500], num_points=1000, rtol=1e-10, atol=1e-12)
     datasets['bound'] = sol_bound
     

@@ -18,7 +18,7 @@ def prepare_training_data(sol, sample_ratio=0.1, lam_max=None):
     """
     sol: scipy.integrate.solve_ivp output
     lam_max: if provided, only use data up to lam_max for training (for extrapolation test)
-    Returns lam_collocation, lam_data, target_data
+    Returns lam_collocation, lam_data, target_data, lam_original, lam_scale
     """
     lam = sol.t
     y = sol.y # shape (6, N)
@@ -42,17 +42,21 @@ def prepare_training_data(sol, sample_ratio=0.1, lam_max=None):
         
     indices = np.sort(indices)
     
-    lam_data = torch.tensor(lam[indices], dtype=torch.float32).view(-1, 1).to(device)
-    # Target data is [t, r, phi]
-    target_data = torch.tensor(y[0:3, indices].T, dtype=torch.float32).to(device)
+    # Scale lambda to [0, 1] for neural network stability
+    lam_scale = float(np.max(lam))
+    lam_scaled = lam / lam_scale
+    
+    lam_data = torch.tensor(lam_scaled[indices], dtype=torch.float32).view(-1, 1).to(device)
+    # Target data is [t, r, phi, ut, ur, uphi]
+    target_data = torch.tensor(y[0:6, indices].T, dtype=torch.float32).to(device)
     
     # 2. Collocation points (dense, for physics loss)
-    lam_collocation = torch.tensor(lam, dtype=torch.float32).view(-1, 1).to(device)
+    lam_collocation = torch.tensor(lam_scaled, dtype=torch.float32).view(-1, 1).to(device)
     lam_collocation.requires_grad = True
     
-    return lam_collocation, lam_data, target_data, lam
+    return lam_collocation, lam_data, target_data, lam, lam_scale
 
-def train_pinn(lam_collocation, lam_data, target_data, alpha, epochs=3000, lr=1e-3):
+def train_pinn(lam_collocation, lam_data, target_data, alpha, lam_scale=1.0, epochs=3000, lr=1e-3):
     pinn = GeodesicPINN(hidden_layers=5, neurons_per_layer=64).to(device)
     optimizer = optim.Adam(pinn.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
@@ -65,7 +69,7 @@ def train_pinn(lam_collocation, lam_data, target_data, alpha, epochs=3000, lr=1e
     for epoch in range(epochs):
         optimizer.zero_grad()
         
-        total_loss, phys_loss, data_loss = get_total_loss(pinn, lam_collocation, lam_data, target_data, alpha)
+        total_loss, phys_loss, data_loss = get_total_loss(pinn, lam_collocation, lam_data, target_data, alpha, lam_scale)
         
         total_loss.backward()
         optimizer.step()
@@ -87,27 +91,27 @@ def run_alpha_sweep(trajectory_data, save_dir="results"):
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
         
-    # We use the bound orbit for the sweep
     sol = trajectory_data['bound']
     
-    # Fixed sampling across all alphas
-    lam_coll, lam_data, target_data, _ = prepare_training_data(sol, sample_ratio=0.1)
+    lam_coll, lam_data, target_data, _, lam_scale = prepare_training_data(sol, sample_ratio=0.1)
     
-    alphas = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    alphas = [0.0, 0.5, 0.9] # Small 3-model test
     results = {}
     
     for alpha in alphas:
-        pinn, history, t_time = train_pinn(lam_coll, lam_data, target_data, alpha, epochs=2500)
+        print(f"\n--- Training alpha = {alpha} ---")
+        pinn, history, t_time = train_pinn(lam_coll, lam_data, target_data, alpha, lam_scale, epochs=2500)
         
         results[alpha] = {
             'model_state': pinn.state_dict(),
             'history': history,
             'train_time': t_time,
             'final_phys': history['physics'][-1],
-            'final_data': history['data'][-1]
+            'final_data': history['data'][-1],
+            'lam_scale': lam_scale
         }
         
-    with open(os.path.join(save_dir, "alpha_sweep.pkl"), "wb") as f:
+    with open("results/alpha_sweep.pkl", "wb") as f:
         pickle.dump(results, f)
     print("Saved alpha sweep results.")
 
@@ -230,9 +234,8 @@ if __name__ == "__main__":
     with open("data/trajectories.pkl", "rb") as f:
         datasets = pickle.load(f)
         
-    # We keep the single alpha sweep for basic testing
+    # Run ONLY the small 3-model test
     run_alpha_sweep(datasets)
-    run_extrapolation_test(datasets)
     
-    # Run the large-scale Pareto sweep
-    run_large_scale_sweep(datasets, epochs=3000)
+    # run_extrapolation_test(datasets)
+    # run_large_scale_sweep(datasets, epochs=3000)
