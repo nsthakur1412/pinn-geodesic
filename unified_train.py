@@ -6,10 +6,9 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 import time
-import os
 import matplotlib.pyplot as plt
 import pickle
-from unified_model import UnifiedPINN, compute_unified_physics_loss
+from unified_model import UnifiedPINN, compute_all_physics_losses
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -20,20 +19,20 @@ def train_unified_pinn():
     print("Loading unified dataset...")
     inputs, targets = torch.load("data/unified_dataset.pt")
     
-    # 2. DataLoader (CRITICAL: Grouping trajectories)
-    # By setting shuffle=False, the batches consist of contiguous lambda sequences
-    # from the same trajectory, maintaining dynamic consistency per batch.
+    # 2. DataLoader
     dataset = TensorDataset(inputs.to(device), targets.to(device))
     batch_size = 512
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     
-    # 3. Model & Optimizers
+    # 3. Model
     pinn = UnifiedPINN(hidden_layers=5, neurons_per_layer=128).to(device)
     
     if os.path.exists("results/unified_pinn.pt"):
         print("Loading pre-trained model to continue training...")
-        pinn.load_state_dict(torch.load("results/unified_pinn.pt", map_location=device, weights_only=True))
-
+        try:
+            pinn.load_state_dict(torch.load("results/unified_pinn.pt", map_location=device, weights_only=True))
+        except Exception as e:
+            print(f"Warning: Could not load weights ({e}). Training from scratch.")
     
     epochs = 4000
     optimizer = optim.Adam(pinn.parameters(), lr=1e-3)
@@ -45,14 +44,15 @@ def train_unified_pinn():
     lambda_ic = 50.0
     lambda_cons = 0.3
     
-    print("Starting DeepONet / Parameterized PINN training...")
+    print("Starting Unified PINN training with conservation laws...")
     start_time = time.time()
     
-    history = {'epoch': [], 'total': [], 'phys': [], 'data': [], 'ic': []}
+    history = {'epoch': [], 'total': [], 'phys': [], 'conserv': [], 'data': []}
     os.makedirs("plots", exist_ok=True)
     
     for epoch in range(epochs):
-        epoch_loss, epoch_phys, epoch_data, epoch_ic = 0.0, 0.0, 0.0, 0.0
+        epoch_loss, epoch_phys, epoch_conserv, epoch_data = 0.0, 0.0, 0.0, 0.0
+        weights = get_weights(epoch)
         
         for batch_inputs, batch_targets in dataloader:
             optimizer.zero_grad()
@@ -62,8 +62,8 @@ def train_unified_pinn():
             target_pos = batch_targets[:, 0:3]
             L_data = nn.MSELoss()(out_norm, target_pos)
             
-            # Physics Loss & Velocity
-            L_phys, vel_phys = compute_unified_physics_loss(pinn, batch_inputs)
+            # Physics + Conservation Loss (single autograd pass)
+            L_geodesic, L_conserv, _ = compute_all_physics_losses(pinn, batch_inputs)
             
             # IC Loss (Strong enforcement)
             # Find indices where lambda == 0 (which we oversampled 5x)
@@ -142,10 +142,9 @@ def train_unified_pinn():
             optimizer.step()
             
             epoch_loss += L_total.item()
-            epoch_phys += L_phys.item()
+            epoch_phys += L_geodesic.item()
+            epoch_conserv += L_conserv.item()
             epoch_data += L_data.item()
-            if ic_mask.sum() > 0:
-                epoch_ic += L_ic.item()
                 
         scheduler.step()
         
@@ -160,25 +159,38 @@ def train_unified_pinn():
             with open("experiments.log", "a") as f:
                 f.write(log_str + "\n")
             
-            # Record history
             history['epoch'].append(epoch)
             history['total'].append(avg_loss)
             history['phys'].append(avg_phys)
+            history['conserv'].append(avg_conserv)
             history['data'].append(avg_data)
-            history['ic'].append(avg_ic)
             
             # Save Live Plot
-            plt.figure(figsize=(8, 6))
-            plt.plot(history['epoch'], history['total'], 'k-', linewidth=2, label='Total Loss')
-            plt.plot(history['epoch'], history['phys'], 'r--', label='Physics Loss')
-            plt.plot(history['epoch'], history['data'], 'b--', label='Data Loss')
-            plt.plot(history['epoch'], history['ic'], 'g--', label='IC Loss')
-            plt.yscale('log')
-            plt.xlabel('Epochs')
-            plt.ylabel('Log MSE Loss')
-            plt.title('Live DeepONet Training Loss')
-            plt.legend()
-            plt.grid(True, alpha=0.3)
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+            
+            ax1.plot(history['epoch'], history['total'], 'k-', linewidth=2, label='Total')
+            ax1.plot(history['epoch'], history['phys'], 'r--', label='Geodesic')
+            ax1.plot(history['epoch'], history['conserv'], 'm--', label='Conservation')
+            ax1.plot(history['epoch'], history['data'], 'b--', label='Data')
+            ax1.set_yscale('log')
+            ax1.set_xlabel('Epoch')
+            ax1.set_ylabel('Loss (log)')
+            ax1.set_title('Training Loss Components')
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+            # Phase boundaries
+            ax1.axvline(x=500, color='gray', linestyle=':', alpha=0.5)
+            ax1.axvline(x=1500, color='gray', linestyle=':', alpha=0.5)
+            
+            # Phase labels
+            if len(history['epoch']) > 1:
+                ax2.bar(['Geodesic', 'Conservation', 'Data'], 
+                       [avg_phys, avg_conserv, avg_data],
+                       color=['#e74c3c', '#9b59b6', '#3498db'])
+                ax2.set_ylabel('Loss Value')
+                ax2.set_title(f'Current Loss Breakdown (Epoch {epoch})')
+                ax2.set_yscale('log')
+            
             plt.tight_layout()
             plt.savefig('plots/live_unified_loss.png', dpi=150)
             plt.close()
@@ -191,7 +203,7 @@ def train_unified_pinn():
     
     os.makedirs("results", exist_ok=True)
     torch.save(pinn.state_dict(), "results/unified_pinn.pt")
-    print("Unified Parameterized PINN saved to results/unified_pinn.pt")
+    print("Unified PINN saved to results/unified_pinn.pt")
 
 if __name__ == "__main__":
     train_unified_pinn()

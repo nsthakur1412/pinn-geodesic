@@ -1,52 +1,67 @@
 # Unified Geodesic PINN 🕳️
 
-A Physics-Informed Neural Network (PINN) architecture designed to learn the geodesic equations for particle motion around a Schwarzschild black hole. Unlike standard neural networks that simply fit a curve, this parameterized PINN (DeepONet architecture) enforces the underlying general relativity physics (energy conservation, angular momentum conservation, and the equations of motion) directly into the loss function, enabling it to accurately model and extrapolate bound, escape, and plunging trajectories from a single unified architecture.
+A Physics-Informed Neural Network (PINN) for learning timelike geodesics in Schwarzschild spacetime (M=1, equatorial plane). This parameterized PINN (DeepONet-style) enforces general relativity directly into the loss function — geodesic equation residuals, energy/angular momentum conservation, and the Hamiltonian constraint — enabling accurate prediction and extrapolation of bound, escape, and plunging trajectories from a single unified architecture.
+
+## Key Features
+- **Hard IC Enforcement**: Output reparametrization guarantees exact initial conditions at λ=0 by construction
+- **Conservation Laws**: Energy (E), angular momentum (L), and Hamiltonian (g_μν u^μ u^ν = -1) enforced as loss terms
+- **Curriculum Learning**: 3-phase training progressively shifts from data-fitting to physics-dominance
+- **Gradient Clipping**: Prevents exploding gradients from second-order autograd
+- **Comprehensive Evaluation**: Trajectory accuracy, conservation violation, phase space, and efficiency benchmarks
 
 ## 🚀 Project Architecture
 
-The core files required to run and experiment with the Unified PINN:
-
-- **`physics.py`**: Contains the core calculations for the physical residuals (Geodesic equations, Hamiltonian constraint) in Schwarzschild geometry.
-- **`rk45_solver.py`**: The ground-truth numerical ODE solver (Runge-Kutta 45) used to generate the dataset.
-- **`unified_dataset.py`**: Script to generate a diverse set of parameterized initial conditions and solve them using `rk45_solver.py` to create the training dataset.
-- **`unified_model.py`**: Defines the DeepONet PINN architecture and the function to calculate the unified physics loss tensor.
-- **`unified_train.py`**: The training loop. Combines data loss, physics loss, and initial condition loss to optimize the network.
-- **`unified_eval.py`**: Evaluates the trained model, comparing its predicted trajectories to the numerical ground truth and generating visualizations.
+| File | Purpose |
+|------|---------|
+| `physics.py` | Schwarzschild geodesic ODEs, conserved quantities |
+| `rk45_solver.py` | Ground-truth RK45 numerical solver |
+| `unified_dataset.py` | Generate 150 diverse parameterized trajectories |
+| `unified_model.py` | DeepONet PINN architecture + physics/conservation loss |
+| `unified_train.py` | Training loop with curriculum learning |
+| `unified_eval.py` | Full evaluation suite (5 metrics + visualizations) |
 
 ## ⚙️ How to Use
 
-### 1. Generate the Dataset
-Before training, you need to generate the ground-truth data. This script simulates various trajectories (bound, scattering, plunging) and saves them to `data/unified_dataset.pt`.
+### 0. Activate Environment
+```bash
+conda activate pinn_gr
+```
 
+### 1. Generate the Dataset
 ```bash
 python unified_dataset.py
 ```
+Generates 150 trajectories (50 bound + 50 escape + 50 capture) saved to `data/unified_dataset.pt`.
 
 ### 2. Train the Model
-Once the dataset is generated, you can train the PINN. The script automatically handles loading the dataset, initializing the neural network, and applying the combined loss function ($L_{total} = \lambda_{phys} L_{phys} + \lambda_{data} L_{data} + \lambda_{ic} L_{ic}$).
-
 ```bash
 python unified_train.py
 ```
+Training uses 3 curriculum phases:
+- **Phase 1 (0-500)**: Data-dominant (λ_data=10, λ_phys=1)
+- **Phase 2 (500-1500)**: Balanced (λ_data=5, λ_phys=5)
+- **Phase 3 (1500-3000)**: Physics-dominant (λ_data=1, λ_phys=10)
 
-> **Note:** If `results/unified_pinn.pt` already exists, the script will automatically load the pre-trained weights and resume training. If you want to train from scratch, delete that file first. Live training loss plots are saved to `plots/live_unified_loss.png`.
+Live loss plots are saved to `plots/live_unified_loss.png`. If `results/unified_pinn.pt` exists, training resumes from that checkpoint. Delete it to train from scratch.
 
-### 3. Evaluate and Visualize
-To test the accuracy and generalization of your trained model, run the evaluation script. This will plot predicted vs actual trajectories and calculate Mean Absolute Error (MAE).
-
+### 3. Evaluate
 ```bash
 python unified_eval.py
 ```
+Runs 5 evaluation modules:
+1. **Trajectory Accuracy** — MAE, RMSE, max deviation vs RK45
+2. **Conservation Violation** — ΔE/E₀, ΔL/L₀, |H+1| over proper time
+3. **Phase Space & Effective Potential** — (r, dr/dλ) portraits
+4. **Long-term Stability** — Error growth rate (Lyapunov exponent)
+5. **Computational Efficiency** — PINN vs RK45 speedup benchmarks
 
-Outputs will be saved in the `plots/` directory.
+All plots saved to `plots/`.
 
-## 🔬 Tuning the Physics Loss
+## 🔬 Loss Function
 
-If you wish to experiment with how strongly the network enforces the laws of physics, modify the static weight parameters in `unified_train.py`:
+$$L_{total} = \lambda_{phys} L_{geodesic} + \lambda_{conserv} L_{conservation} + \lambda_{data} L_{data}$$
 
-```python
-lambda_phys = 10.0  # Weight for Geodesic and Hamiltonian constraints
-lambda_data = 1.0   # Weight for matching the ground truth data
-lambda_ic = 5.0     # Weight for enforcing initial conditions
-```
-Increasing `lambda_phys` forces the network to adhere more strictly to relativity at the cost of being harder to optimize.
+Where:
+- $L_{geodesic}$: Residuals of the 3 geodesic ODEs (second derivatives)
+- $L_{conservation} = L_E + L_L + L_H$: Conservation of energy, angular momentum, Hamiltonian
+- $L_{data}$: MSE against RK45 ground truth
