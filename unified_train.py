@@ -1,3 +1,6 @@
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -32,13 +35,15 @@ def train_unified_pinn():
         pinn.load_state_dict(torch.load("results/unified_pinn.pt", map_location=device, weights_only=True))
 
     
-    epochs = 3000
+    epochs = 4000
     optimizer = optim.Adam(pinn.parameters(), lr=1e-3)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
     
-    lambda_phys = 10.0
-    lambda_data = 1.0
-    lambda_ic = 5.0
+    # ChatGPT suggestions
+    lambda_phys = 1.0
+    lambda_data = 0.3
+    lambda_ic = 50.0
+    lambda_cons = 0.3
     
     print("Starting DeepONet / Parameterized PINN training...")
     start_time = time.time()
@@ -91,10 +96,49 @@ def train_unified_pinn():
             else:
                 L_ic = torch.tensor(0.0, device=device)
             
-            # Total Balanced Loss
-            L_total = lambda_phys * L_phys + lambda_data * L_data + lambda_ic * L_ic
+            # P3: Conservation Losses (E, L)
+            _, out_phys = pinn(batch_inputs)
+            r_p = out_phys[:, 1:2]
+            ut_p = vel_phys[:, 0:1]
+            uphi_p = vel_phys[:, 2:3]
+            
+            # Predicted E and L
+            f_p = 1.0 - 2.0 / (r_p + 1e-6)
+            E_p = f_p * ut_p
+            L_p = (r_p**2) * uphi_p
+            
+            # Target E and L from batch_targets (un-normalized)
+            target_r_norm = batch_targets[:, 1:2]
+            target_ut_norm = batch_targets[:, 3:4]
+            target_uphi_norm = batch_targets[:, 5:6]
+            
+            r_mean, r_std = pinn.scalers['r_mean'], pinn.scalers['r_std']
+            ut_mean, ut_std = pinn.scalers['ut_mean'], pinn.scalers['ut_std']
+            uphi_mean, uphi_std = pinn.scalers['uphi_mean'], pinn.scalers['uphi_std']
+            
+            r_t = target_r_norm * r_std + r_mean
+            ut_t = target_ut_norm * ut_std + ut_mean
+            uphi_t = target_uphi_norm * uphi_std + uphi_mean
+            
+            f_t = 1.0 - 2.0 / (r_t + 1e-6)
+            E_t = f_t * ut_t
+            L_t = (r_t**2) * uphi_t
+            
+            # P1: Hamiltonian Conservation
+            ur_p = vel_phys[:, 1:2]
+            H_p = -f_p * (ut_p**2) + (1.0 / (f_p + 1e-6)) * (ur_p**2) + (r_p**2) * (uphi_p**2) + 1.0
+            
+            L_E = torch.mean((E_p - E_t)**2)
+            L_L = torch.mean((L_p - L_t)**2)
+            L_H = torch.mean(H_p**2)
+            L_cons = L_E + L_L + L_H
+            
+            # P2: Final loss function
+            L_total = (lambda_phys * L_phys + lambda_data * L_data + 
+                       lambda_ic * L_ic + lambda_cons * L_cons)
             
             L_total.backward()
+            torch.nn.utils.clip_grad_norm_(pinn.parameters(), 1.0) # P4: Gradient clipping
             optimizer.step()
             
             epoch_loss += L_total.item()
@@ -105,13 +149,16 @@ def train_unified_pinn():
                 
         scheduler.step()
         
-        if epoch % 50 == 0 or epoch == epochs - 1:
+        if epoch % 10 == 0 or epoch == epochs - 1:
             avg_loss = epoch_loss / len(dataloader)
             avg_phys = epoch_phys / len(dataloader)
             avg_data = epoch_data / len(dataloader)
             avg_ic = epoch_ic / len(dataloader)
             ratio = avg_phys / (avg_data + 1e-6)
-            print(f"Epoch {epoch:3d} | Total: {avg_loss:.2e} | Phys: {avg_phys:.2e} | Data: {avg_data:.2e} | IC: {avg_ic:.2e} | Phys/Data: {ratio:.2e}")
+            log_str = f"Epoch {epoch:3d} | Total: {avg_loss:.2e} | Phys: {avg_phys:.2e} | Data: {avg_data:.2e} | IC: {avg_ic:.2e} | Phys/Data: {ratio:.2e}"
+            print(log_str)
+            with open("experiments.log", "a") as f:
+                f.write(log_str + "\n")
             
             # Record history
             history['epoch'].append(epoch)

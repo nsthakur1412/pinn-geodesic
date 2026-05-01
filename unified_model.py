@@ -47,15 +47,13 @@ class UnifiedPINN(nn.Module):
         raw_r = out[:, 1:2]
         phi_norm = out[:, 2:3]
         
-        # Stability constraint: Wall off the r=2M singularity
-        r_phys = 2.1 + F.softplus(raw_r)
-        
+        # P2: Remove bias in r prediction
+        # We un-standardize raw_r to physical scale directly
         device = inputs.device
-        
-        # Standardize physical r to match target data scales
         r_mean = torch.tensor(self.scalers['r_mean'], dtype=torch.float32, device=device)
         r_std = torch.tensor(self.scalers['r_std'], dtype=torch.float32, device=device)
-        r_norm = (r_phys - r_mean) / r_std
+        r_phys = raw_r * r_std + r_mean
+        r_norm = raw_r
         
         # Un-standardize t and phi to physical scales
         t_mean = torch.tensor(self.scalers['t_mean'], dtype=torch.float32, device=device)
@@ -110,14 +108,8 @@ def compute_unified_physics_loss(pinn, inputs):
     res_r = dur_dlam + ((r - 2.0) / (r**3 + 1e-6)) * ut**2 - (1.0 / denom) * ur**2 - (r - 2.0) * uphi**2
     res_phi = duphi_dlam + 2.0 * (1.0 / (r + 1e-6)) * ur * uphi
     
-    # Residual Balancing (dynamic self-scaling to prevent one dimension from overpowering)
-    scale_t = torch.mean(res_t.detach()**2) + 1e-8
-    scale_r = torch.mean(res_r.detach()**2) + 1e-8
-    scale_phi = torch.mean(res_phi.detach()**2) + 1e-8
-    
-    physics_loss = (torch.mean(res_t**2) / scale_t + 
-                    torch.mean(res_r**2) / scale_r + 
-                    torch.mean(res_phi**2) / scale_phi) / 3.0
+    # P0: Fix physics loss (simple sum of squares)
+    physics_loss = torch.mean(res_t**2) + torch.mean(res_r**2) + torch.mean(res_phi**2)
                     
     # Return both loss and the computed physical velocities for IC enforcement
     vel_phys = torch.cat([dt_dlam, dr_dlam, dphi_dlam], dim=1)
