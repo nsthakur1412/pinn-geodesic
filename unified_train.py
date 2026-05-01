@@ -6,9 +6,10 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 import time
+import os
 import matplotlib.pyplot as plt
 import pickle
-from unified_model import UnifiedPINN, compute_all_physics_losses
+from unified_model import UnifiedPINN, compute_unified_physics_loss
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -19,51 +20,61 @@ def train_unified_pinn():
     print("Loading unified dataset...")
     inputs, targets = torch.load("data/unified_dataset.pt")
     
-    # 2. DataLoader
+    # 2. DataLoader (CRITICAL: Grouping trajectories)
+    # By setting shuffle=False, the batches consist of contiguous lambda sequences
+    # from the same trajectory, maintaining dynamic consistency per batch.
     dataset = TensorDataset(inputs.to(device), targets.to(device))
     batch_size = 512
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     
-    # 3. Model
+    # 3. Model & Optimizers
     pinn = UnifiedPINN(hidden_layers=5, neurons_per_layer=128).to(device)
-    
-    if os.path.exists("results/unified_pinn.pt"):
-        print("Loading pre-trained model to continue training...")
-        try:
-            pinn.load_state_dict(torch.load("results/unified_pinn.pt", map_location=device, weights_only=True))
-        except Exception as e:
-            print(f"Warning: Could not load weights ({e}). Training from scratch.")
     
     epochs = 4000
     optimizer = optim.Adam(pinn.parameters(), lr=1e-3)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
     
-    # ChatGPT suggestions
-    lambda_phys = 1.0
-    lambda_data = 0.3
+    os.makedirs("checkpoints", exist_ok=True)
+    best_loss = float('inf')
+    start_epoch = 0
+    
+    import glob
+    ckpts = glob.glob("checkpoints/ckpt_*.pt")
+    if ckpts:
+        latest_ckpt = max(ckpts, key=os.path.getctime)
+        print(f"Loading checkpoint {latest_ckpt} to resume training...")
+        ckpt = torch.load(latest_ckpt, map_location=device, weights_only=False)
+        pinn.load_state_dict(ckpt['model_state'])
+        optimizer.load_state_dict(ckpt['optimizer_state'])
+        start_epoch = ckpt['epoch'] + 1
+    
+    # Hyperparameters for loss balancing
+    alpha = 0.7
+    lambda_phys = 5.0
     lambda_ic = 50.0
     lambda_cons = 0.3
     
-    print("Starting Unified PINN training with conservation laws...")
+    print("Starting DeepONet / Parameterized PINN training...")
     start_time = time.time()
     
-    history = {'epoch': [], 'total': [], 'phys': [], 'conserv': [], 'data': []}
+    history = {'epoch': [], 'total': [], 'phys': [], 'data': [], 'ic': []}
     os.makedirs("plots", exist_ok=True)
     
-    for epoch in range(epochs):
-        epoch_loss, epoch_phys, epoch_conserv, epoch_data = 0.0, 0.0, 0.0, 0.0
-        weights = get_weights(epoch)
+    for epoch in range(start_epoch, epochs):
+        epoch_loss, epoch_phys, epoch_data, epoch_ic = 0.0, 0.0, 0.0, 0.0
+        
+        # Strengthen physics signal early on
+        lambda_phys = 5.0 if epoch <= 500 else 1.0
         
         for batch_inputs, batch_targets in dataloader:
             optimizer.zero_grad()
             
+            # Physics Loss, Velocity, and Outputs (ALL in ONE forward pass!)
+            L_phys, vel_phys, out_norm, out_phys = compute_unified_physics_loss(pinn, batch_inputs)
+            
             # Data Loss (MSE on normalized outputs vs standardized targets)
-            out_norm, _ = pinn(batch_inputs)
             target_pos = batch_targets[:, 0:3]
             L_data = nn.MSELoss()(out_norm, target_pos)
-            
-            # Physics + Conservation Loss (single autograd pass)
-            L_geodesic, L_conserv, _ = compute_all_physics_losses(pinn, batch_inputs)
             
             # IC Loss (Strong enforcement)
             # Find indices where lambda == 0 (which we oversampled 5x)
@@ -97,7 +108,6 @@ def train_unified_pinn():
                 L_ic = torch.tensor(0.0, device=device)
             
             # P3: Conservation Losses (E, L)
-            _, out_phys = pinn(batch_inputs)
             r_p = out_phys[:, 1:2]
             ut_p = vel_phys[:, 0:1]
             uphi_p = vel_phys[:, 2:3]
@@ -133,67 +143,56 @@ def train_unified_pinn():
             L_H = torch.mean(H_p**2)
             L_cons = L_E + L_L + L_H
             
-            # P2: Final loss function
-            L_total = (lambda_phys * L_phys + lambda_data * L_data + 
-                       lambda_ic * L_ic + lambda_cons * L_cons)
+            # P2: Final loss function with alpha-balancing
+            L_total = (alpha * lambda_phys * L_phys + 
+                       (1 - alpha) * L_data + 
+                       lambda_ic * L_ic + 
+                       lambda_cons * L_cons)
             
             L_total.backward()
             torch.nn.utils.clip_grad_norm_(pinn.parameters(), 1.0) # P4: Gradient clipping
             optimizer.step()
             
             epoch_loss += L_total.item()
-            epoch_phys += L_geodesic.item()
-            epoch_conserv += L_conserv.item()
+            epoch_phys += L_phys.item()
             epoch_data += L_data.item()
+            if ic_mask.sum() > 0:
+                epoch_ic += L_ic.item()
                 
         scheduler.step()
         
+        avg_loss = epoch_loss / len(dataloader)
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            torch.save(pinn.state_dict(), "checkpoints/best_model.pt")
+
         if epoch % 10 == 0 or epoch == epochs - 1:
-            avg_loss = epoch_loss / len(dataloader)
             avg_phys = epoch_phys / len(dataloader)
             avg_data = epoch_data / len(dataloader)
             avg_ic = epoch_ic / len(dataloader)
             ratio = avg_phys / (avg_data + 1e-6)
             log_str = f"Epoch {epoch:3d} | Total: {avg_loss:.2e} | Phys: {avg_phys:.2e} | Data: {avg_data:.2e} | IC: {avg_ic:.2e} | Phys/Data: {ratio:.2e}"
             print(log_str)
+            print(f"Epoch {epoch} | IC error: {avg_ic:.4e}")
             with open("experiments.log", "a") as f:
                 f.write(log_str + "\n")
             
+            # Record history
             history['epoch'].append(epoch)
             history['total'].append(avg_loss)
             history['phys'].append(avg_phys)
-            history['conserv'].append(avg_conserv)
             history['data'].append(avg_data)
+            history['ic'].append(avg_ic)
             
-            # Save Live Plot
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-            
-            ax1.plot(history['epoch'], history['total'], 'k-', linewidth=2, label='Total')
-            ax1.plot(history['epoch'], history['phys'], 'r--', label='Geodesic')
-            ax1.plot(history['epoch'], history['conserv'], 'm--', label='Conservation')
-            ax1.plot(history['epoch'], history['data'], 'b--', label='Data')
-            ax1.set_yscale('log')
-            ax1.set_xlabel('Epoch')
-            ax1.set_ylabel('Loss (log)')
-            ax1.set_title('Training Loss Components')
-            ax1.legend()
-            ax1.grid(True, alpha=0.3)
-            # Phase boundaries
-            ax1.axvline(x=500, color='gray', linestyle=':', alpha=0.5)
-            ax1.axvline(x=1500, color='gray', linestyle=':', alpha=0.5)
-            
-            # Phase labels
-            if len(history['epoch']) > 1:
-                ax2.bar(['Geodesic', 'Conservation', 'Data'], 
-                       [avg_phys, avg_conserv, avg_data],
-                       color=['#e74c3c', '#9b59b6', '#3498db'])
-                ax2.set_ylabel('Loss Value')
-                ax2.set_title(f'Current Loss Breakdown (Epoch {epoch})')
-                ax2.set_yscale('log')
-            
-            plt.tight_layout()
-            plt.savefig('plots/live_unified_loss.png', dpi=150)
-            plt.close()
+        # Checkpoint saving
+        if epoch % 100 == 0:
+            torch.save({
+                'epoch': epoch,
+                'model_state': pinn.state_dict(),
+                'optimizer_state': optimizer.state_dict(),
+                'loss': avg_loss
+            }, f"checkpoints/ckpt_{epoch}.pt")
+            print(f"Saved checkpoint: checkpoints/ckpt_{epoch}.pt")
             
             with open("data/unified_history.pkl", "wb") as f:
                 pickle.dump(history, f)
@@ -203,7 +202,7 @@ def train_unified_pinn():
     
     os.makedirs("results", exist_ok=True)
     torch.save(pinn.state_dict(), "results/unified_pinn.pt")
-    print("Unified PINN saved to results/unified_pinn.pt")
+    print("Unified Parameterized PINN saved to results/unified_pinn.pt")
 
 if __name__ == "__main__":
     train_unified_pinn()

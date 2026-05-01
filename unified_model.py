@@ -3,13 +3,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pickle
 
+class FourierFeatures(nn.Module):
+    def __init__(self, gamma=0.5):
+        super().__init__()
+        self.gamma = gamma
+        
+    def forward(self, lam):
+        # lam shape: (N, 1)
+        scaled = lam * self.gamma * torch.pi
+        return torch.cat([lam, torch.sin(scaled), torch.cos(scaled)], dim=-1)
+
 class UnifiedPINN(nn.Module):
-    def __init__(self, hidden_layers=5, neurons_per_layer=128):
+    def __init__(self, hidden_layers=5, neurons_per_layer=128, gamma=0.5):
         super().__init__()
         
+        self.fourier = FourierFeatures(gamma=gamma)
+        
+        # input dim = 1 (lam) + 2 (sin, cos) + 3 (r0, ur0, L) = 6
+        input_dim = 6
+        
         layers = []
-        # Input: [lam_scaled, r0_norm, ur0_norm, L_norm] -> 4
-        layers.append(nn.Linear(4, neurons_per_layer))
+        layers.append(nn.Linear(input_dim, neurons_per_layer))
         layers.append(nn.SiLU())
         
         for _ in range(hidden_layers - 1):
@@ -73,18 +87,26 @@ class UnifiedPINN(nn.Module):
         lam_scale = self.scalers['lam_scale']
         lam_p = lam_s * lam_scale  # physical lambda
         
+        # Apply Fourier Features to lambda
+        lam_features = self.fourier(lam_s)
+        
+        # Concat with other inputs
+        other_inputs = inputs[:, 1:]
+        nn_inputs = torch.cat([lam_features, other_inputs], dim=-1)
+        
+        # Get neural network correction
+        nn_out = self.network(nn_inputs)
+        
         # Physical ICs
         r0, ur0, uphi0, ut0, E0, L0 = self._get_physical_ics(inputs)
         
-        # P2: Remove bias in r prediction
-        # We un-standardize raw_r to physical scale directly
-        device = inputs.device
-        r_mean = torch.tensor(self.scalers['r_mean'], dtype=torch.float32, device=device)
-        r_std = torch.tensor(self.scalers['r_std'], dtype=torch.float32, device=device)
-        r_phys = raw_r * r_std + r_mean
-        r_norm = raw_r
+        # Hard IC Reparametrization for physical coordinates
+        t_phys = 0.0 + ut0 * lam_p + (lam_s**2) * nn_out[:, 0:1]
+        r_phys = r0 + ur0 * lam_p + (lam_s**2) * nn_out[:, 1:2]
+        phi_phys = 0.0 + uphi0 * lam_p + (lam_s**2) * nn_out[:, 2:3]
         
-        # Un-standardize t and phi to physical scales
+        # Un-standardize t, r, phi to get normalized targets
+        device = inputs.device
         t_mean = torch.tensor(self.scalers['t_mean'], dtype=torch.float32, device=device)
         t_std = torch.tensor(self.scalers['t_std'], dtype=torch.float32, device=device)
         r_mean = torch.tensor(self.scalers['r_mean'], dtype=torch.float32, device=device)
@@ -102,7 +124,7 @@ class UnifiedPINN(nn.Module):
         return out_norm, out_phys
 
 
-def compute_all_physics_losses(pinn, inputs):
+def compute_unified_physics_loss(pinn, inputs):
     """
     Computes ALL physics losses in a single autograd pass:
       1. Geodesic residuals (second-order ODE)
@@ -110,14 +132,14 @@ def compute_all_physics_losses(pinn, inputs):
       3. Conservation of Angular Momentum L
       4. Hamiltonian constraint g_μν u^μ u^ν = -1
     
-    Returns: geodesic_loss, conservation_loss, vel_phys
+    Returns: geodesic_loss, vel_phys
     """
     # Isolate lambda for autograd
     lam_scaled = inputs[:, 0:1].clone().detach().requires_grad_(True)
     other_inputs = inputs[:, 1:4].clone().detach()
     model_inputs = torch.cat([lam_scaled, other_inputs], dim=1)
     
-    _, out_phys = pinn(model_inputs)
+    out_norm, out_phys = pinn(model_inputs)
     t = out_phys[:, 0:1]
     r = out_phys[:, 1:2]
     phi = out_phys[:, 2:3]
@@ -147,5 +169,5 @@ def compute_all_physics_losses(pinn, inputs):
     physics_loss = torch.mean(res_t**2) + torch.mean(res_r**2) + torch.mean(res_phi**2)
                     
     # Return both loss and the computed physical velocities for IC enforcement
-    vel_phys = torch.cat([dt_dlam, dr_dlam, dphi_dlam], dim=1)
-    return physics_loss, vel_phys
+    vel_phys = torch.cat([ut, ur, uphi], dim=1)
+    return physics_loss, vel_phys, out_norm, out_phys

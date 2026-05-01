@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# Data and Checkpoints
+checkpoints/
+data/
+*.pt
+*.pth
+*.pkl
+
+# Visualization
+plots/
+*.png
+*.jpg
+*.jpeg
+*.pdf
+
+# Logs
+*.log
+experiments.log

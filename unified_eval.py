@@ -27,11 +27,26 @@ TEST_CASES = [
 
 def load_model():
     pinn = UnifiedPINN(hidden_layers=5, neurons_per_layer=128).to(device)
-    try:
-        pinn.load_state_dict(torch.load("results/unified_pinn.pt", map_location=device, weights_only=True))
-    except FileNotFoundError:
-        print("Error: Train the model first with unified_train.py!")
+    paths = ["checkpoints/best_model.pt", "results/unified_pinn.pt"]
+    
+    loaded = False
+    for path in paths:
+        if os.path.exists(path):
+            try:
+                # Use weights_only=True for safety
+                state_dict = torch.load(path, map_location=device, weights_only=True)
+                pinn.load_state_dict(state_dict)
+                print(f"Successfully loaded model from {path}")
+                loaded = True
+                break
+            except Exception as e:
+                print(f"Warning: Could not load from {path} ({e})")
+                continue
+    
+    if not loaded:
+        print("Error: No trained model found in checkpoints/ or results/!")
         return None
+        
     pinn.eval()
     return pinn
 
@@ -86,9 +101,9 @@ def get_pinn_velocities(pinn, r0, ur0, L, lam_array):
     
     ones = torch.ones_like(lam_t)
     ls = scalers['lam_scale']
-    ut = torch.autograd.grad(t_p, lam_t, ones, create_graph=False)[0] / ls
-    ur_v = torch.autograd.grad(r_p, lam_t, ones, create_graph=False)[0] / ls
-    uphi = torch.autograd.grad(phi_p, lam_t, ones, create_graph=False)[0] / ls
+    ut = torch.autograd.grad(t_p, lam_t, ones, retain_graph=True)[0] / ls
+    ur_v = torch.autograd.grad(r_p, lam_t, ones, retain_graph=True)[0] / ls
+    uphi = torch.autograd.grad(phi_p, lam_t, ones, retain_graph=False)[0] / ls
     
     positions = out_phys.detach().cpu().numpy()
     velocities = torch.cat([ut, ur_v, uphi], dim=1).detach().cpu().numpy()
@@ -145,7 +160,7 @@ def eval_trajectory_accuracy(pinn):
         })
         
         verdict = "EXCELLENT" if max_dev < 3 else ("OK" if max_dev < 10 else "FAIL")
-        print(f"  [{i+1}/{n}] {case['name']:25s} | MAE(r)={mae_r:.3f}M | MAE(φ)={mae_phi:.3f}rad | MaxDev={max_dev:.2f}M | RelRMSE={rel_rmse:.3%} | {verdict}")
+        print(f"  [{i+1}/{n}] {case['name']:25s} | MAE(r)={mae_r:.3f}M | MAE(phi)={mae_phi:.3f}rad | MaxDev={max_dev:.2f}M | RelRMSE={rel_rmse:.3%} | {verdict}")
         
         # Plot
         ax = axes[i]
@@ -228,7 +243,7 @@ def eval_conservation(pinn):
         axes[2, col].legend(fontsize=8)
         axes[2, col].grid(True, alpha=0.3)
         
-        print(f"  {case['name']:25s} | max ΔE/E₀(PINN)={np.max(dE_pinn):.2e} | max ΔL/L₀(PINN)={np.max(dL_pinn):.2e} | max |H+1|(PINN)={np.max(np.abs(H_pinn+1)):.2e}")
+        print(f"  {case['name']:25s} | max dE/E0(PINN)={np.max(dE_pinn):.2e} | max dL/L0(PINN)={np.max(dL_pinn):.2e} | max |H+1|(PINN)={np.max(np.abs(H_pinn+1)):.2e}")
     
     plt.tight_layout()
     plt.savefig('plots/eval_conservation.png', dpi=200)
@@ -351,10 +366,10 @@ def eval_long_term(pinn):
         coeffs = np.polyfit(lam_mask, log_err, 1)
         gamma = coeffs[0]
         axes[1].plot(lam_mask, np.exp(np.polyval(coeffs, lam_mask)), 'k--', 
-                    label=f'γ = {gamma:.4f}')
+                    label=f'gamma = {gamma:.4f}')
         axes[1].legend()
         stability = "STABLE" if gamma < 0.01 else ("MARGINAL" if gamma < 0.05 else "UNSTABLE")
-        print(f"  Lyapunov-like exponent γ = {gamma:.4f} ({stability})")
+        print(f"  Lyapunov-like exponent gamma = {gamma:.4f} ({stability})")
     
     plt.tight_layout()
     plt.savefig('plots/eval_long_term.png', dpi=200)
