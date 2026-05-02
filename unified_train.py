@@ -5,204 +5,135 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
+import csv
 import time
-import os
-import matplotlib.pyplot as plt
-import pickle
-from unified_model import UnifiedPINN, compute_unified_physics_loss
+from scientific_framework import ScientificMLP, compute_physics_metrics, run_standard_eval, log_to_csv
+from extensive_study_eval import run_extreme_tests # Re-using extreme eval logic
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-def train_unified_pinn():
-    print(f"Using device: {device}")
+def run_production_training():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"STARTING STAGE 4: 4,000 EPOCH PRODUCTION RUN ON {device}")
     
-    # 1. Load Data
-    print("Loading unified dataset...")
-    inputs, targets = torch.load("data/unified_dataset.pt")
-    
-    # 2. DataLoader (CRITICAL: Grouping trajectories)
-    # By setting shuffle=False, the batches consist of contiguous lambda sequences
-    # from the same trajectory, maintaining dynamic consistency per batch.
+    # 1. Setup
+    inputs, targets = torch.load("data/unified_dataset.pt", weights_only=False)
     dataset = TensorDataset(inputs.to(device), targets.to(device))
-    batch_size = 512
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    dataloader = DataLoader(dataset, batch_size=4096, shuffle=True)
     
-    # 3. Model & Optimizers
-    pinn = UnifiedPINN(hidden_layers=5, neurons_per_layer=128).to(device)
-    
+    # Use the Refined 6x256 Residual Architecture
+    model = ScientificMLP(hidden_layers=6, neurons_per_layer=256, use_residual=True).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
     epochs = 4000
-    optimizer = optim.Adam(pinn.parameters(), lr=1e-3)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
     
-    os.makedirs("checkpoints", exist_ok=True)
-    best_loss = float('inf')
-    start_epoch = 0
-    
-    import glob
-    ckpts = glob.glob("checkpoints/ckpt_*.pt")
-    if ckpts:
-        latest_ckpt = max(ckpts, key=os.path.getctime)
-        print(f"Loading checkpoint {latest_ckpt} to resume training...")
-        ckpt = torch.load(latest_ckpt, map_location=device, weights_only=False)
-        pinn.load_state_dict(ckpt['model_state'])
-        optimizer.load_state_dict(ckpt['optimizer_state'])
-        start_epoch = ckpt['epoch'] + 1
-    
-    # Hyperparameters for loss balancing
-    alpha = 0.7
-    lambda_phys = 5.0
+    # Weights from the 'Stiff' breakthrough
+    lambda_phys = 20.0
     lambda_ic = 50.0
-    lambda_cons = 0.3
+    lambda_cons = 2.0
     
-    print("Starting DeepONet / Parameterized PINN training...")
-    start_time = time.time()
+    csv_path = "results/long_duration_study.csv"
+    latest_ckpt = "results/checkpoint_latest.pt"
     
-    history = {'epoch': [], 'total': [], 'phys': [], 'data': [], 'ic': []}
-    os.makedirs("plots", exist_ok=True)
+    start_epoch = 0
+    if os.path.exists(latest_ckpt):
+        checkpoint = torch.load(latest_ckpt, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        print(f"RESUMING TRAINING FROM EPOCH {start_epoch}")
+    else:
+        if os.path.exists(csv_path): os.remove(csv_path)
+        print("STARTING FRESH TRAINING")
     
-    for epoch in range(start_epoch, epochs):
-        epoch_loss, epoch_phys, epoch_data, epoch_ic = 0.0, 0.0, 0.0, 0.0
-        
-        # Strengthen physics signal early on
-        lambda_phys = 5.0 if epoch <= 500 else 1.0
+    checkpoints = [500, 1000, 2000, 3000, 4000]
+    
+    t0_all = time.time()
+    for epoch in range(start_epoch, epochs + 1):
+        model.train()
+        epoch_loss, epoch_data, epoch_phys, epoch_ic = 0.0, 0.0, 0.0, 0.0
         
         for batch_inputs, batch_targets in dataloader:
             optimizer.zero_grad()
+            out_norm, _ = model(batch_inputs)
             
-            # Physics Loss, Velocity, and Outputs (ALL in ONE forward pass!)
-            L_phys, vel_phys, out_norm, out_phys = compute_unified_physics_loss(pinn, batch_inputs)
+            # Data Loss
+            L_data = nn.MSELoss()(out_norm, batch_targets[:, 0:3])
             
-            # Data Loss (MSE on normalized outputs vs standardized targets)
-            target_pos = batch_targets[:, 0:3]
-            L_data = nn.MSELoss()(out_norm, target_pos)
+            # IC Loss
+            ic_mask = (batch_inputs[:, 0] == 0.0)
+            L_ic = nn.MSELoss()(out_norm[ic_mask], batch_targets[ic_mask, 0:3]) if ic_mask.sum() > 0 else torch.tensor(0.0, device=device)
             
-            # IC Loss (Strong enforcement)
-            # Find indices where lambda == 0 (which we oversampled 5x)
-            lam_scaled = batch_inputs[:, 0]
-            ic_mask = (lam_scaled == 0.0)
+            # Physics Loss
+            p_loss, E, L_p, H, dE, dL, _, _, _ = compute_physics_metrics(model, batch_inputs)
             
-            if ic_mask.sum() > 0:
-                # Position IC
-                ic_pred_norm = out_norm[ic_mask]
-                ic_target_pos = target_pos[ic_mask]
-                L_ic_pos = nn.MSELoss()(ic_pred_norm, ic_target_pos)
-                
-                # Velocity IC
-                # Convert physical velocity predictions to normalized scale to match targets
-                ic_vel_phys = vel_phys[ic_mask]
-                
-                ut_mean, ut_std = pinn.scalers['ut_mean'], pinn.scalers['ut_std']
-                ur_mean, ur_std = pinn.scalers['ur_mean'], pinn.scalers['ur_std']
-                uphi_mean, uphi_std = pinn.scalers['uphi_mean'], pinn.scalers['uphi_std']
-                
-                ic_ut_norm = (ic_vel_phys[:, 0:1] - ut_mean) / ut_std
-                ic_ur_norm = (ic_vel_phys[:, 1:2] - ur_mean) / ur_std
-                ic_uphi_norm = (ic_vel_phys[:, 2:3] - uphi_mean) / uphi_std
-                
-                ic_vel_pred_norm = torch.cat([ic_ut_norm, ic_ur_norm, ic_uphi_norm], dim=1)
-                ic_target_vel = batch_targets[ic_mask][:, 3:6]
-                L_ic_vel = nn.MSELoss()(ic_vel_pred_norm, ic_target_vel)
-                
-                L_ic = L_ic_pos + L_ic_vel
-            else:
-                L_ic = torch.tensor(0.0, device=device)
+            # Corrected Conservation: dE/dlam = 0, dL/dlam = 0, and H = -1
+            # This works across ALL initial conditions simultaneously
+            L_cons = torch.mean(dE**2) + torch.mean(dL**2) + torch.mean((H + 1.0)**2)
             
-            # P3: Conservation Losses (E, L)
-            r_p = out_phys[:, 1:2]
-            ut_p = vel_phys[:, 0:1]
-            uphi_p = vel_phys[:, 2:3]
+            # Total Loss
+            loss = L_data + lambda_phys * p_loss + lambda_ic * L_ic + lambda_cons * L_cons
+            loss.backward()
             
-            # Predicted E and L
-            f_p = 1.0 - 2.0 / (r_p + 1e-6)
-            E_p = f_p * ut_p
-            L_p = (r_p**2) * uphi_p
+            # STABILITY: Gradient Clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             
-            # Target E and L from batch_targets (un-normalized)
-            target_r_norm = batch_targets[:, 1:2]
-            target_ut_norm = batch_targets[:, 3:4]
-            target_uphi_norm = batch_targets[:, 5:6]
-            
-            r_mean, r_std = pinn.scalers['r_mean'], pinn.scalers['r_std']
-            ut_mean, ut_std = pinn.scalers['ut_mean'], pinn.scalers['ut_std']
-            uphi_mean, uphi_std = pinn.scalers['uphi_mean'], pinn.scalers['uphi_std']
-            
-            r_t = target_r_norm * r_std + r_mean
-            ut_t = target_ut_norm * ut_std + ut_mean
-            uphi_t = target_uphi_norm * uphi_std + uphi_mean
-            
-            f_t = 1.0 - 2.0 / (r_t + 1e-6)
-            E_t = f_t * ut_t
-            L_t = (r_t**2) * uphi_t
-            
-            # P1: Hamiltonian Conservation
-            ur_p = vel_phys[:, 1:2]
-            H_p = -f_p * (ut_p**2) + (1.0 / (f_p + 1e-6)) * (ur_p**2) + (r_p**2) * (uphi_p**2) + 1.0
-            
-            L_E = torch.mean((E_p - E_t)**2)
-            L_L = torch.mean((L_p - L_t)**2)
-            L_H = torch.mean(H_p**2)
-            L_cons = L_E + L_L + L_H
-            
-            # P2: Final loss function with alpha-balancing
-            L_total = (alpha * lambda_phys * L_phys + 
-                       (1 - alpha) * L_data + 
-                       lambda_ic * L_ic + 
-                       lambda_cons * L_cons)
-            
-            L_total.backward()
-            torch.nn.utils.clip_grad_norm_(pinn.parameters(), 1.0) # P4: Gradient clipping
             optimizer.step()
             
-            epoch_loss += L_total.item()
-            epoch_phys += L_phys.item()
+            epoch_loss += loss.item()
             epoch_data += L_data.item()
-            if ic_mask.sum() > 0:
-                epoch_ic += L_ic.item()
-                
+            epoch_phys += p_loss.item()
+            epoch_ic += L_ic.item()
+            
         scheduler.step()
         
-        avg_loss = epoch_loss / len(dataloader)
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            torch.save(pinn.state_dict(), "checkpoints/best_model.pt")
-
-        if epoch % 10 == 0 or epoch == epochs - 1:
-            avg_phys = epoch_phys / len(dataloader)
-            avg_data = epoch_data / len(dataloader)
-            avg_ic = epoch_ic / len(dataloader)
-            ratio = avg_phys / (avg_data + 1e-6)
-            log_str = f"Epoch {epoch:3d} | Total: {avg_loss:.2e} | Phys: {avg_phys:.2e} | Data: {avg_data:.2e} | IC: {avg_ic:.2e} | Phys/Data: {ratio:.2e}"
-            print(log_str)
-            print(f"Epoch {epoch} | IC error: {avg_ic:.4e}")
-            with open("experiments.log", "a") as f:
-                f.write(log_str + "\n")
+        # Logging & Checkpointing
+        if epoch in checkpoints or epoch % 10 == 0:
+            avg_loss = epoch_loss / len(dataloader)
+            print(f"Epoch {epoch}/{epochs} | Loss: {avg_loss:.4e}")
             
-            # Record history
-            history['epoch'].append(epoch)
-            history['total'].append(avg_loss)
-            history['phys'].append(avg_phys)
-            history['data'].append(avg_data)
-            history['ic'].append(avg_ic)
+            # Only do full scientific eval at major milestones
+            if epoch in checkpoints:
+                eval_res = run_standard_eval(model, device)
+                torch.save(model.state_dict(), f"results/model_stage4_epoch_{epoch}.pt")
+                print(f"Saved checkpoint and ran full eval at epoch {epoch}")
+                
+                log_data = {
+                    'experiment_type': 'Stage4-LongTrain',
+                    'epoch': epoch,
+                    'total_loss': avg_loss,
+                    'data_loss': epoch_data / len(dataloader),
+                    'phys_loss': epoch_phys / len(dataloader),
+                    'ic_loss': epoch_ic / len(dataloader),
+                    'energy_drift': eval_res['Bound']['e_drift'],
+                    'angular_momentum_drift': eval_res['Bound']['l_drift'],
+                    'hamiltonian_violation': eval_res['Bound']['h_violation'],
+                    'bound_max_dev': eval_res['Bound']['max_dev'],
+                    'escape_max_dev': eval_res['Escape']['max_dev'],
+                    'capture_max_dev': eval_res['Capture']['max_dev']
+                }
+            else:
+                # Fast logging for intermediate epochs
+                log_data = {
+                    'experiment_type': 'Stage4-LongTrain',
+                    'epoch': epoch,
+                    'total_loss': avg_loss,
+                    'data_loss': epoch_data / len(dataloader),
+                    'phys_loss': epoch_phys / len(dataloader),
+                    'ic_loss': epoch_ic / len(dataloader),
+                    'energy_drift': 0, 'angular_momentum_drift': 0, 'hamiltonian_violation': 0,
+                    'bound_max_dev': 0, 'escape_max_dev': 0, 'capture_max_dev': 0
+                }
+            log_to_csv(log_data, file_path=csv_path)
             
-        # Checkpoint saving
-        if epoch % 100 == 0:
+            # Save latest for resume capability
             torch.save({
                 'epoch': epoch,
-                'model_state': pinn.state_dict(),
-                'optimizer_state': optimizer.state_dict(),
-                'loss': avg_loss
-            }, f"checkpoints/ckpt_{epoch}.pt")
-            print(f"Saved checkpoint: checkpoints/ckpt_{epoch}.pt")
-            
-            with open("data/unified_history.pkl", "wb") as f:
-                pickle.dump(history, f)
-            
-    train_time = time.time() - start_time
-    print(f"\nTraining completed in {train_time:.2f}s")
-    
-    os.makedirs("results", exist_ok=True)
-    torch.save(pinn.state_dict(), "results/unified_pinn.pt")
-    print("Unified Parameterized PINN saved to results/unified_pinn.pt")
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': avg_loss,
+            }, latest_ckpt)
+
+    t1_all = time.time()
+    print(f"STAGE 4 COMPLETE. Total Time: {(t1_all-t0_all)/3600:.2f} hours.")
 
 if __name__ == "__main__":
-    train_unified_pinn()
+    run_production_training()

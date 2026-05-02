@@ -39,22 +39,24 @@ def generate_unified_dataset(num_traj_per_type=50):
             except ValueError:
                 continue  # Skip invalid ICs
             
-            # Integrate
-            sol = solve_geodesic(state, [0, 300], num_points=500)
+            # Integrate with dense output enabled
+            sol = solve_geodesic(state, [0, 300], num_points=1000)
             
-            lam = sol.t
-            y = sol.y  # [t, r, phi, ut, ur, uphi]
+            # Uniformly sample from the solution
+            lam_max = sol.t[-1]
+            lam_uniform = np.linspace(0, lam_max, 1000)
+            y_uniform = sol.sol(lam_uniform) # [t, r, phi, ut, ur, uphi]
             
             # Skip very short integrations (particle hit horizon immediately)
-            if len(lam) < 20:
+            if lam_max < 1.0:
                 continue
             
-            for i in range(len(lam)):
+            for i in range(len(lam_uniform)):
                 # Oversample lambda=0 (5x) for IC enforcement backup
                 repeats = 5 if i == 0 else 1
                 for _ in range(repeats):
-                    all_inputs.append([lam[i], r0, ur0, L])
-                    all_targets.append(y[:, i])
+                    all_inputs.append([lam_uniform[i], r0, ur0, L])
+                    all_targets.append(y_uniform[:, i])
                     
     inputs_arr = np.array(all_inputs)
     targets_arr = np.array(all_targets)

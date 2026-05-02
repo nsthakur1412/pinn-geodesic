@@ -5,10 +5,15 @@ __pycache__/
 
 # Data and Checkpoints
 checkpoints/
-data/
-*.pt
-*.pth
-*.pkl
+data/*
+results/*
+!data/unified_dataset.pt
+!data/unified_scalers.pkl
+!results/*.pt
+!results/*.csv
+!results/*.md
+!results/*.png
+!plots/*.png
 
 # Visualization
 plots/

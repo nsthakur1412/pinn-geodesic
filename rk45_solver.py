@@ -25,6 +25,7 @@ def solve_geodesic(initial_state, lam_span, num_points=1000, rtol=1e-8, atol=1e-
     """
     Solves the geodesic equations using scipy's RK45.
     Stops integration if the particle hits the event horizon (r <= 2.01).
+    Returns the solution object with dense_output enabled.
     """
     
     # Event function to stop integration near the event horizon
@@ -32,14 +33,12 @@ def solve_geodesic(initial_state, lam_span, num_points=1000, rtol=1e-8, atol=1e-
         return state[1] - 2.01 # Stop at r = 2.01
     horizon_event.terminal = True
     
-    lam_eval = np.linspace(lam_span[0], lam_span[1], num_points)
-    
     sol = solve_ivp(
         fun=geodesic_odes,
         t_span=lam_span,
         y0=initial_state,
         method='RK45',
-        t_eval=lam_eval,
+        dense_output=True,
         events=horizon_event,
         rtol=rtol,
         atol=atol
